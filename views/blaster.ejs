@@ -159,7 +159,7 @@
         const numbersEl = document.getElementById('numbers');
         const messageEl = document.getElementById('message');
         const logsEl = document.getElementById('logs');
-        const socket = io();
+        const socket = io({ query: { userId: '<%= userId %>' } });
 
         // Modal elements
         const contactModal = document.getElementById('contactModal');

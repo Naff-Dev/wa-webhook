@@ -1,5 +1,5 @@
 <header class="navbar">
-    <h2 class="navbar-title">Dashboard</h2>
+    <h2 class="navbar-title"><%= typeof title !== 'undefined' ? title : 'Dashboard' %></h2>
     <div class="user-menu">
         <form id="logoutForm" action="/logout-user" method="POST">
             <button type="submit" class="btn-logout">

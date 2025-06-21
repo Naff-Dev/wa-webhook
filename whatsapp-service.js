@@ -10,6 +10,10 @@ const path = require('path');
 const cookieParser = require('cookie-parser');
 const supabase = require('./supabaseClient');
 const crypto = require('crypto');
+const multer = require('multer');
+const vCard = require('vcf');
+const csv = require('csv-parser');
+const { Readable } = require('stream');
 
 const app = express();
 const server = http.createServer(app);
@@ -30,6 +34,19 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+
+// Multer setup for file uploads
+const upload = multer({
+    storage: multer.memoryStorage(),
+    fileFilter: (req, file, cb) => {
+        const fileExt = path.extname(file.originalname).toLowerCase();
+        if (fileExt === '.vcf' || file.mimetype === 'text/vcard' || file.mimetype === 'text/x-vcard' || fileExt === '.csv' || file.mimetype === 'text/csv' || file.mimetype === 'application/vnd.ms-excel') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only .vcf and .csv files are allowed!'), false);
+        }
+    }
+});
 
 // Authentication Middleware
 async function isAuthenticated(req, res, next) {
@@ -79,15 +96,11 @@ async function isAuthenticatedOrApiKey(req, res, next) {
     return isAuthenticated(req, res, next);
 }
 
-// WhatsApp Service Globals
-let sock;
-let qrCode = null;
-let isConnected = false;
-let connectionState = 'disconnected';
+// WhatsApp Service Globals (multi-tenant)
+const sessions = new Map(); // userId => { sock, isConnected, state, qr, keepAliveTimer }
+
 let appSettings = {};
 let autoReplies = [];
-let isWhatsAppServiceStarted = false; // Flag to ensure single startup
-let keepAliveTimer = null; // interval ID for presence keep-alive
 
 // Load settings and auto-replies from Supabase
 async function loadSettings() {
@@ -109,139 +122,151 @@ async function loadSettings() {
     }
 }
 
-// Fungsi untuk memulai koneksi WhatsApp
-async function startWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+// ------------------ Multi-Tenant Session Helpers ------------------
 
-    sock = makeWASocket({
+function getEffectiveUserId(req) {
+    return req.user?.id || req.apiUserId;
+}
+
+/**
+ * Ensure WhatsApp session exists for given user ID. Returns session object.
+ */
+async function ensureSession(userId) {
+    if (sessions.has(userId)) return sessions.get(userId);
+
+    const authDir = path.join(__dirname, 'auth_info_baileys', userId);
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    const session = {
+        sock: null,
+        isConnected: false,
+        state: 'disconnected',
+        qr: null,
+        keepAliveTimer: null
+    };
+
+    const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
         browser: ['WhatsApp API', 'Chrome', '1.0.0'],
-        // shorter keep-alive at transport level to reduce idle disconnects
         keepAliveIntervalMs: 20_000,
-        // stay offline in WA presence to not trigger push suppression, we'll manage presence manually
         markOnlineOnConnect: false
     });
 
-    // Periodic presence ping to keep the session warm & prevent idle disconnects
-    if (keepAliveTimer) clearInterval(keepAliveTimer);
-    keepAliveTimer = setInterval(async () => {
-        try {
-            if (sock && isConnected) {
-                await sock.sendPresenceUpdate('available');
-            }
-        } catch (err) {
-            // silent catch, presence errors are non-fatal
+    session.sock = sock;
+
+    // keep-alive presence
+    session.keepAliveTimer = setInterval(async () => {
+        if (session.isConnected) {
+            try { await sock.sendPresenceUpdate('available'); } catch {}
         }
     }, 25_000);
 
+    sock.ev.on('creds.update', saveCreds);
+
+    // -------- connection handling --------
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        const { connection, qr, lastDisconnect } = update;
 
         if (qr) {
-            qrCode = qr;
-            connectionState = 'qr_ready';
-            console.log('QR Code generated');
-            // Emit QR code ke frontend
-            io.emit('qr', qr);
+            session.qr = qr;
+            session.state = 'qr_ready';
+            io.to(userId).emit('qr', qr);
+        }
+
+        if (connection === 'open') {
+            session.isConnected = true;
+            session.state = 'connected';
+            session.qr = null;
+            io.to(userId).emit('connection_status', { status: 'connected' });
         }
 
         if (connection === 'close') {
-            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+            session.isConnected = false;
+            session.state = 'disconnected';
+            io.to(userId).emit('connection_status', { status: 'disconnected' });
 
-            console.log('Connection closed. Code:', statusCode, isLoggedOut ? '(logged out)' : '');
+            if (session.keepAliveTimer) clearInterval(session.keepAliveTimer);
+            sessions.delete(userId);
 
-            // Reset state & notify UI
-            isConnected = false;
-            connectionState = 'disconnected';
-            io.emit('connection_status', { status: 'disconnected' });
-
-            if (isLoggedOut) {
-                // Remove stored auth credentials so a new QR is mandatory on next connect
-                try {
-                    const authPath = path.join(__dirname, 'auth_info_baileys');
-                    if (fs.existsSync(authPath)) {
-                        fs.rmSync(authPath, { recursive: true, force: true });
-                        console.log('auth_info_baileys directory deleted due to logout.');
-                    }
-                } catch (err) {
-                    console.error('Failed to delete auth_info_baileys directory:', err);
-                }
+            const code = (lastDisconnect?.error)?.output?.statusCode;
+            const loggedOut = code === DisconnectReason.loggedOut;
+            if (loggedOut) {
+                try { if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive:true, force:true }); } catch {}
             }
 
-            // Attempt to reconnect (new QR will be generated if logged out)
-            setTimeout(() => startWhatsApp(), 1_000);
-        } else if (connection === 'open') {
-            console.log('WhatsApp connection opened');
-            isConnected = true;
-            connectionState = 'connected';
-            qrCode = null;
-            io.emit('connection_status', { status: 'connected' });
+            setTimeout(() => ensureSession(userId), 1_000);
         }
     });
 
-    sock.ev.on('creds.update', saveCreds);
-
-    // Handle incoming messages
+    // -------- auto-reply --------
     sock.ev.on('messages.upsert', async (m) => {
         const message = m.messages[0];
         if (!message.key.fromMe && m.type === 'notify') {
-            const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text;
+            const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
+            
+            const contextInfo = message.message?.extendedTextMessage?.contextInfo;
+            let quoted_text = null;
+            let quoted_sender = null;
+            let reply_to_id = null;
+            
+            if (contextInfo?.quotedMessage) {
+                quoted_text = contextInfo.quotedMessage.conversation || contextInfo.quotedMessage.extendedTextMessage?.text || '...';
+                quoted_sender = contextInfo.participant;
+                const { data: repliedToMsg } = await supabase.from('messages').select('id').eq('stanza_id', contextInfo.stanzaId).eq('user_id', userId).maybeSingle() || {};
+                if(repliedToMsg) reply_to_id = repliedToMsg.id;
+            }
 
-            // Auto-reply bot logic (enabled by default unless explicitly disabled)
+            const recordedMessage = await recordMessage({
+                userId,
+                chatJid: message.key.remoteJid,
+                sender: message.pushName || message.key.participant || message.key.remoteJid,
+                senderJid: message.key.participant || message.key.remoteJid,
+                text: messageText,
+                direction: 'in',
+                timestamp: (message.messageTimestamp || Date.now()) * 1000,
+                stanzaId: message.key.id,
+                rawMessage: message.message,
+                replyToId: reply_to_id,
+                quoted_text: quoted_text,
+                quoted_sender: quoted_sender
+            });
+
+            if(recordedMessage) io.to(userId).emit('new_message', recordedMessage);
+
             const autoReplyEnabled = appSettings.auto_reply_enabled !== 'false';
             if (autoReplyEnabled && !message.key.remoteJid.endsWith('@g.us') && messageText) {
-                const msgLower = messageText.trim().toLowerCase();
-                const matchedReply = autoReplies.find(rule => {
-                    if (!rule.enabled) return false;
-                    const kw = String(rule.keyword || '').toLowerCase().trim();
-                    return kw && msgLower.includes(kw);
-                });
-
-                if (matchedReply) {
+                const lower = messageText.trim().toLowerCase();
+                const rule = autoReplies.find(r => r.enabled && lower.includes(String(r.keyword || '').toLowerCase().trim()));
+                if (rule) {
                     try {
-                        await sock.sendMessage(message.key.remoteJid, { text: matchedReply.reply });
-                        console.log(`Auto-reply sent (rule '${matchedReply.keyword}') to ${message.key.remoteJid}`);
-                    } catch (error) {
-                        console.error(`Failed to send auto-reply to ${message.key.remoteJid}:`, error);
-                    }
-                } else {
-                    console.log('No auto-reply match for incoming message:', msgLower);
+                        await sock.sendMessage(message.key.remoteJid, { text: rule.reply });
+                        const recordedReply = await recordMessage({
+                            userId,
+                            chatJid: message.key.remoteJid,
+                            sender: 'auto-reply',
+                            text: rule.reply,
+                            direction: 'out',
+                            timestamp: Date.now(),
+                            stanzaId: result.key.id,
+                            rawMessage: result.message,
+                            replyToId: reply_to_id,
+                            quotedText: quoted_text,
+                            quotedSender: quoted_sender,
+                            senderJid: s.sock.user.id.replace(/:.*$/,'@s.whatsapp.net')
+                        });
+                        if(recordedReply) io.to(userId).emit('new_message', recordedReply);
+                    } catch {}
                 }
             }
-            console.log('Received message:', message);
-
-            let groupName = null;
-            let sender = null;
-
-            // Cek apakah dari grup
-            if (message.key.remoteJid.endsWith('@g.us')) {
-                const groupMetadata = await sock.groupMetadata(message.key.remoteJid);
-                groupName = groupMetadata.subject; // Nama grup
-                sender = message.pushName; // Nomor pengirim di grup
-            } else {
-                sender = message.pushName; // Kalau private chat, sender = pengirim langsung
-            }
-            console.log(sender)
-
-            const messageData = {
-                id: message.key.id,
-                from: message.key.remoteJid,
-                sender: sender,
-                groupName: groupName,
-                message: message.message?.conversation ||
-                    message.message?.extendedTextMessage?.text ||
-                    'Media message',
-                timestamp: message.messageTimestamp
-            };
-
-            io.emit('new_message', messageData);
-            console.log('New message received:', messageData);
         }
     });
 
+    sessions.set(userId, session);
+    return session;
 }
+
+// Note: legacy single-tenant startWhatsApp removed after multi-tenant refactor
 
 // --- ROUTES ---
 
@@ -282,17 +307,17 @@ app.get('/', (req, res) => {
     res.redirect('/dashboard');
 });
 
-app.get('/dashboard', isAuthenticated, (req, res) => {
-    if (!isWhatsAppServiceStarted) {
-        console.log('First dashboard visit, starting WhatsApp service...');
-        startWhatsApp();
-        isWhatsAppServiceStarted = true;
-    }
-    res.render('dashboard', { page: 'dashboard' });
+app.get('/dashboard', isAuthenticated, async (req, res) => {
+    await ensureSession(req.user.id);
+    res.render('dashboard', { page: 'dashboard', userId: req.user.id });
+});
+
+app.get('/chat', isAuthenticated, (req, res) => {
+    res.render('chat', { page: 'chat', userId: req.user.id });
 });
 
 app.get('/blaster', isAuthenticated, (req, res) => {
-    res.render('blaster', { page: 'blaster' });
+    res.render('blaster', { page: 'blaster', userId: req.user.id });
 });
 
 // Documentation Route
@@ -301,119 +326,310 @@ app.get('/documentation', isAuthenticated, (req, res) => {
 });
 
 // WhatsApp Service Routes
-app.get('/status', isAuthenticatedOrApiKey, (req, res) => {
-    res.json({ status: connectionState, connected: isConnected, qr: qrCode });
+app.get('/status', isAuthenticatedOrApiKey, async (req, res) => {
+    try {
+        const uid = getEffectiveUserId(req);
+        const s = await ensureSession(uid);
+        return res.json({ status: s.state, connected: s.isConnected, qr: s.qr });
+    } catch (error) {
+        console.error('Status route error:', error);
+        return res.status(500).json({ error: 'internal_error', message: error.message });
+    }
 });
 
 app.post('/send-message', isAuthenticatedOrApiKey, async (req, res) => {
+    const { to, message, reply_to_id } = req.body;
+    if (!to || !message) return res.status(400).json({ error: 'Missing "to" or "message"' });
+
+    const uid = getEffectiveUserId(req);
+    const s = await ensureSession(uid);
+    if (!s.isConnected) return res.status(400).json({ error: 'WhatsApp not connected' });
+
+    const phone = to.includes('@') ? to : `${to}@s.whatsapp.net`;
     try {
-        const { to, message } = req.body;
-
-        if (!isConnected) {
-            return res.status(400).json({ error: 'WhatsApp not connected' });
+        let quotedInfo = undefined;
+        let quotedDbRecord = null;
+        if (reply_to_id) {
+            const { data } = await supabase.from('messages').select('*').eq('id', reply_to_id).eq('user_id', uid).single();
+            if (data) {
+                quotedDbRecord = data;
+                quotedInfo = {
+                    key: {
+                        remoteJid: data.chat_jid,
+                        id: data.stanza_id,
+                        fromMe: data.direction === 'out',
+                        participant: data.sender_jid,
+                    },
+                    message: data.raw_message
+                };
+            }
         }
 
-        if (!to || !message) {
-            return res.status(400).json({ error: 'Missing required fields: to, message' });
-        }
-
-        // Format nomor telepon
-        const phoneNumber = to.includes('@s.whatsapp.net') ? to : `${to}@s.whatsapp.net`;
-
-        const result = await sock.sendMessage(phoneNumber, { text: message });
-
-        res.json({
-            success: true,
-            messageId: result.key.id,
-            to: phoneNumber,
-            message: message
+        const result = await s.sock.sendMessage(phone, { text: message }, { quoted: quotedInfo });
+        
+        const recordedOutgoing = await recordMessage({
+            userId: uid,
+            chatJid: phone,
+            sender: 'me',
+            text: message,
+            direction: 'out',
+            timestamp: Date.now(),
+            stanzaId: result.key.id,
+            rawMessage: result.message,
+            replyToId: reply_to_id,
+            quotedText: quotedDbRecord?.message,
+            quotedSender: quotedDbRecord?.sender,
+            senderJid: s.sock.user.id.replace(/:.*$/,'@s.whatsapp.net')
         });
 
-    } catch (error) {
-        console.error('Error sending message:', error);
-        res.status(500).json({ error: 'Failed to send message', details: error.message });
+        if(recordedOutgoing) io.to(uid).emit('new_message', recordedOutgoing);
+
+        res.json({ success: true, messageId: result.key.id, to: phone, message });
+    } catch (err) {
+        console.error('Error sending message:', err);
+        res.status(500).json({ error: 'Failed', details: err.message });
     }
 });
 
 app.post('/logout', isAuthenticated, async (req, res) => {
+    const uid = req.user.id;
+    const s = sessions.get(uid);
+    if (!s) return res.json({ success: true });
+
     try {
-        if (sock) {
-            await sock.logout();
-        }
+        await s.sock.logout();
+    } catch {}
 
-        // Hapus auth info
-        const authPath = path.join(__dirname, 'auth_info_baileys');
-        if (fs.existsSync(authPath)) {
-            fs.rmSync(authPath, { recursive: true, force: true });
-        }
+    if (s.keepAliveTimer) clearInterval(s.keepAliveTimer);
+    sessions.delete(uid);
 
-        isConnected = false;
-        connectionState = 'disconnected';
-        qrCode = null;
+    const dir = path.join(__dirname, 'auth_info_baileys', uid);
+    try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive:true, force:true }); } catch {}
 
-        res.json({ success: true, message: 'Logged out successfully' });
-
-        // Restart connection untuk generate QR baru
-        setTimeout(() => {
-            startWhatsApp();
-        }, 1000);
-
-    } catch (error) {
-        console.error('Error logging out:', error);
-        res.status(500).json({ error: 'Failed to logout', details: error.message });
-    }
+    res.json({ success: true, message: 'Logged out' });
 });
 
 // Blaster Route
 app.post('/send-bulk', isAuthenticatedOrApiKey, async (req, res) => {
     const { numbers, message } = req.body;
-    if (!numbers || !message) {
-        return res.status(400).json({ success: false, error: 'Numbers and message are required.' });
-    }
+    if (!numbers || !message) return res.status(400).json({ success:false, error:'Numbers and message are required.' });
 
-    if (!isConnected) {
-        return res.status(400).json({ success: false, error: 'WhatsApp is not connected.' });
-    }
+    const uid = getEffectiveUserId(req);
+    const s = await ensureSession(uid);
+    if (!s.isConnected) return res.status(400).json({ success:false, error:'WhatsApp is not connected.' });
 
-    const numberList = numbers.split('\n').map(n => n.trim()).filter(n => n);
+    const numberList = numbers.split('\n').map(n=>n.trim()).filter(Boolean);
+    res.json({ success:true, message:`Bulk sending started for ${numberList.length} numbers.` });
 
-    res.json({ success: true, message: `Bulk sending process started for ${numberList.length} numbers.` });
-
-    // Run the sending process in the background
-    (async () => {
-        for (const number of numberList) {
-            try {
-                const phoneNumber = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
-                await sock.sendMessage(phoneNumber, { text: message });
-                io.emit('bulk-log', { status: 'success', message: `Successfully sent to ${number}` });
-            } catch (error) {
-                console.error(`Failed to send to ${number}:`, error);
-                io.emit('bulk-log', { status: 'error', message: `Failed to send to ${number}. Reason: ${error.message}` });
+    (async ()=>{
+        for(const n of numberList){
+            const jid = n.includes('@')? n : `${n}@s.whatsapp.net`;
+            try{
+                await s.sock.sendMessage(jid,{ text: message });
+                io.to(uid).emit('bulk-log',{ status:'success', message:`Sent to ${n}`});
+                recordMessage({ userId: uid, chatJid: jid, sender: 'me', text: message, direction: 'out', timestamp: Date.now() });
+            }catch(err){
+                io.to(uid).emit('bulk-log',{ status:'error', message:`Failed to send to ${n}: ${err.message}`});
             }
-            // Add a random delay between 2 to 7 seconds
-            const delay = Math.floor(Math.random() * 5000) + 2000;
-            await new Promise(resolve => setTimeout(resolve, delay));
+            await new Promise(r=>setTimeout(r, Math.floor(Math.random()*5000)+2000));
         }
-        io.emit('bulk-log', { status: 'done', message: 'Bulk sending process finished.' });
+        io.to(uid).emit('bulk-log',{ status:'done', message:'Bulk sending finished.'});
     })();
 });
 
 // Contacts Management Routes
 app.get('/contacts', isAuthenticated, async (req, res) => {
-    const { data, error } = await supabase.from('contacts').select('*').order('name', { ascending: true });
-    res.render('contacts', { contacts: data || [], error: error?.message, success: null, page: 'contacts' });
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const pageSize = 15;
+        const offset = (page - 1) * pageSize;
+        const userId = req.user.id;
+
+        // Get total number of contacts for pagination
+        const { count, error: countError } = await supabase
+            .from('contacts')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', userId);
+
+        if (countError) throw countError;
+
+        // Get contacts for the current page
+        const { data, error } = await supabase
+            .from('contacts')
+            .select('*')
+            .eq('user_id', userId)
+            .order('name', { ascending: true })
+            .range(offset, offset + pageSize - 1);
+
+        if (error) throw error;
+        
+        res.render('contacts', { 
+            contacts: data || [], 
+            error: req.query.error, 
+            success: req.query.success, 
+            page: 'contacts',
+            totalPages: Math.ceil(count / pageSize),
+            currentPage: page
+        });
+    } catch (error) {
+        res.render('contacts', { 
+            contacts: [], 
+            error: 'Failed to load contacts.', 
+            success: null, 
+            page: 'contacts',
+            totalPages: 0,
+            currentPage: 1
+        });
+    }
 });
 
 app.post('/contacts/add', isAuthenticated, async (req, res) => {
     const { name, phone } = req.body;
     const { error } = await supabase.from('contacts').insert({ name, phone });
 
-    const { data } = await supabase.from('contacts').select('*').order('name', { ascending: true });
-    res.render('contacts', { contacts: data || [], error: error?.message, success: error ? null : 'Contact added!', page: 'contacts' });
+    if (error) {
+        return res.redirect('/contacts?error=' + encodeURIComponent(error.message));
+    }
+    res.redirect('/contacts?success=Contact added successfully.');
+});
+
+app.post('/contacts/import', isAuthenticated, upload.single('vcfFile'), async (req, res) => {
+    if (!req.file) {
+        return res.redirect('/contacts?error=' + encodeURIComponent('No file uploaded.'));
+    }
+
+    try {
+        const vcfContent = req.file.buffer.toString('utf8');
+        const cards = vCard.parse(vcfContent);
+
+        if (!cards || cards.length === 0) {
+            return res.redirect('/contacts?error=' + encodeURIComponent('VCF file is empty or invalid.'));
+        }
+
+        const parsedContacts = cards.map(card => {
+            const name = card.data.fn;
+            const phoneProp = card.data.tel?.[0];
+            const phone = phoneProp ? phoneProp.valueOf().replace(/\D/g, '') : null;
+            if (!name || !phone) return null;
+            return { user_id: req.user.id, name: name.valueOf(), phone: phone };
+        }).filter(Boolean);
+
+        const { data: existingContacts, error: fetchError } = await supabase
+            .from('contacts')
+            .select('phone')
+            .eq('user_id', req.user.id);
+
+        if (fetchError) throw fetchError;
+
+        const existingPhones = new Set(existingContacts.map(c => c.phone));
+        const uniqueNewContacts = [];
+        const phonesInThisBatch = new Set();
+        
+        for (const contact of parsedContacts) {
+            if (!existingPhones.has(contact.phone) && !phonesInThisBatch.has(contact.phone)) {
+                uniqueNewContacts.push(contact);
+                phonesInThisBatch.add(contact.phone);
+            }
+        }
+        
+        const duplicateCount = parsedContacts.length - uniqueNewContacts.length;
+
+        if (uniqueNewContacts.length > 0) {
+            const { error } = await supabase.from('contacts').insert(uniqueNewContacts);
+            if (error) throw error;
+        }
+        
+        let successMessage = `${uniqueNewContacts.length} contacts imported successfully.`;
+        if (duplicateCount > 0) {
+            successMessage += ` ${duplicateCount} duplicates were ignored.`;
+        }
+        
+        res.redirect('/contacts?success=' + encodeURIComponent(successMessage));
+
+    } catch (error) {
+        console.error('Error importing VCF file:', error);
+        res.redirect('/contacts?error=' + encodeURIComponent('Failed to import contacts from VCF file. ' + error.message));
+    }
+});
+
+app.post('/contacts/import/csv', isAuthenticated, upload.single('csvFile'), async (req, res) => {
+    if (!req.file) {
+        return res.redirect('/contacts?error=' + encodeURIComponent('No file uploaded.'));
+    }
+
+    const parsedContacts = [];
+    const buffer = req.file.buffer;
+    const stream = Readable.from(buffer.toString());
+
+    stream.pipe(csv({ mapHeaders: ({ header }) => header.trim() }))
+        .on('data', (row) => {
+            const firstName = row['First Name'] || '';
+            const middleName = row['Middle Name'] || '';
+            const lastName = row['Last Name'] || '';
+            let name = `${firstName} ${middleName} ${lastName}`.replace(/\s+/g, ' ').trim();
+            if (!name) {
+                name = row['File As'] || row['Nickname'];
+            }
+            const phone = row['Phone 1 - Value'];
+            if (name && phone) {
+                parsedContacts.push({
+                    user_id: req.user.id,
+                    name: name,
+                    phone: phone.replace(/\D/g, '')
+                });
+            }
+        })
+        .on('end', async () => {
+            if (parsedContacts.length === 0) {
+                return res.redirect('/contacts?error=' + encodeURIComponent('No valid contacts found in the CSV file.'));
+            }
+
+            try {
+                const { data: existingContacts, error: fetchError } = await supabase
+                    .from('contacts')
+                    .select('phone')
+                    .eq('user_id', req.user.id);
+
+                if (fetchError) throw fetchError;
+
+                const existingPhones = new Set(existingContacts.map(c => c.phone));
+                const uniqueNewContacts = [];
+                const phonesInThisBatch = new Set();
+
+                for (const contact of parsedContacts) {
+                    if (!existingPhones.has(contact.phone) && !phonesInThisBatch.has(contact.phone)) {
+                        uniqueNewContacts.push(contact);
+                        phonesInThisBatch.add(contact.phone);
+                    }
+                }
+
+                const duplicateCount = parsedContacts.length - uniqueNewContacts.length;
+
+                if (uniqueNewContacts.length > 0) {
+                    const { error } = await supabase.from('contacts').insert(uniqueNewContacts);
+                    if (error) throw error;
+                }
+
+                let successMessage = `${uniqueNewContacts.length} contacts imported successfully.`;
+                if (duplicateCount > 0) {
+                    successMessage += ` ${duplicateCount} duplicates were ignored.`;
+                }
+                res.redirect('/contacts?success=' + encodeURIComponent(successMessage));
+            } catch (error) {
+                console.error('Error importing CSV file:', error);
+                res.redirect('/contacts?error=' + encodeURIComponent('Failed to import contacts from CSV file. ' + error.message));
+            }
+        })
+        .on('error', (error) => {
+            console.error('Error processing CSV file:', error);
+            res.redirect('/contacts?error=' + encodeURIComponent('Failed to process CSV file. ' + error.message));
+        });
 });
 
 app.post('/contacts/delete/:id', isAuthenticated, async (req, res) => {
-    await supabase.from('contacts').delete().match({ id: req.params.id });
+    const { id } = req.params;
+    const userId = req.user.id;
+    await supabase.from('contacts').delete().match({ id: id });
     res.redirect('/contacts');
 });
 
@@ -486,20 +702,48 @@ app.post('/api-keys/delete/:id', isAuthenticated, async (req, res) => {
     res.redirect('/api-keys');
 });
 
+// -------- Chat API --------
+app.get('/api/chats', isAuthenticated, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('messages')
+            .select('id, chat_jid, message, timestamp, sender')
+            .eq('user_id', req.user.id)
+            .order('timestamp', { ascending: false });
+        if (error) throw error;
+        // aggregate last message per chat_jid
+        const map = new Map();
+        for (const row of data) {
+            if (!map.has(row.chat_jid)) map.set(row.chat_jid, row);
+        }
+        res.json(Array.from(map.values()));
+    } catch (err) {
+        console.error('Fetch chats error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/chats/:jid', isAuthenticated, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('messages')
+            .select('*')
+            .eq('user_id', req.user.id)
+            .eq('chat_jid', req.params.jid)
+            .order('timestamp', { ascending: true });
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        console.error('Fetch chat messages error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-    console.log('Client connected to socket');
-
-    // Send current status to the newly connected client
-    socket.emit('connection_status', { status: connectionState });
-
-    if (qrCode) {
-        socket.emit('qr', qrCode);
-    }
-
-    socket.on('disconnect', () => {
-        console.log('Client disconnected from socket');
-    });
+    const uid = socket.handshake.query.userId;
+    if (uid) socket.join(uid);
+    console.log('Socket connected for user:', uid);
 });
 
 // Server Initialization
@@ -510,7 +754,33 @@ server.listen(PORT, '0.0.0.0', () => {
 
 // Initial Load and Start
 loadSettings();
-// Mulai koneksi WhatsApp segera setelah server online
-startWhatsApp();
-isWhatsAppServiceStarted = true;
+
+// ---------- Message Persistence Helper ----------
+async function recordMessage(params) {
+    const {
+        userId, chatJid, sender, text, direction, timestamp,
+        stanzaId, rawMessage, replyToId, quotedText, quotedSender, senderJid
+    } = params;
+    try {
+        const { data, error } = await supabase.from('messages').insert({
+            user_id: userId,
+            chat_jid: chatJid,
+            sender: sender,
+            message: text,
+            direction: direction,
+            timestamp: new Date(timestamp).toISOString(),
+            stanza_id: stanzaId,
+            raw_message: rawMessage,
+            reply_to_id: replyToId,
+            quoted_text: quotedText,
+            quoted_sender: quotedSender,
+            sender_jid: senderJid
+        }).select().single();
+        if(error) throw error;
+        return data;
+    } catch (err) {
+        console.error('Failed to record message:', err);
+        return null;
+    }
+}
 

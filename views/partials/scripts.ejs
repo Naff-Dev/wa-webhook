@@ -1,6 +1,6 @@
 <script>
     // Socket.IO connections
-    const socket = io();
+    const socket = io({ query: { userId: '<%= userId %>' } });
 
     let currentStatus = 'disconnected';
     let messages = [];
