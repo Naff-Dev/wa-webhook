@@ -275,6 +275,83 @@ app.get('/login', (req, res) => {
     res.render('login', { error: null });
 });
 
+app.get('/register', (req, res) => {
+    res.render('register', { error: null, success: null });
+});
+
+app.post('/register', async (req, res) => {
+    const { name, email, password, confirmPassword } = req.body;
+    
+    // Validation
+    if (!name || !email || !password || !confirmPassword) {
+        return res.render('register', { 
+            error: 'All fields are required', 
+            success: null 
+        });
+    }
+    
+    if (password !== confirmPassword) {
+        return res.render('register', { 
+            error: 'Passwords do not match', 
+            success: null 
+        });
+    }
+    
+    if (password.length < 6) {
+        return res.render('register', { 
+            error: 'Password must be at least 6 characters long', 
+            success: null 
+        });
+    }
+    
+    try {
+        // 1) Attempt to sign up the user
+        const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+            email,
+            password,
+            options: {
+                data: { full_name: name }
+            }
+        });
+        if (signUpError) {
+            return res.render('register', { error: signUpError.message, success: null });
+        }
+
+        // 2) If Supabase did NOT return a session (common when using service key),
+        //    attempt to sign the user in to retrieve a session token.
+        let session = signUpData.session;
+        if (!session) {
+            const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({ email, password });
+            if (!signInError) {
+                session = signInData.session;
+            }
+        }
+
+        // 3) If we managed to obtain a session, log the user in immediately.
+        if (session) {
+            res.cookie('supabase-auth-token', JSON.stringify(session), {
+                httpOnly: true,
+                secure: process.env.NODE_ENV === 'production',
+                maxAge: session.expires_in * 1000,
+            });
+            return res.redirect('/dashboard');
+        }
+
+        // 4) Fallback: ask the user to confirm their email first.
+        return res.render('register', {
+            error: null,
+            success: 'Registration successful! Please check your email to confirm your account before logging in.'
+        });
+
+    } catch (err) {
+        console.error('Registration error:', err);
+        return res.render('register', {
+            error: 'An unexpected error occurred. Please try again.',
+            success: null
+        });
+    }
+});
+
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
     const { data, error } = await supabase.auth.signInWithPassword({
@@ -634,7 +711,12 @@ app.post('/contacts/delete/:id', isAuthenticated, async (req, res) => {
 });
 
 app.get('/api/contacts', isAuthenticatedOrApiKey, async (req, res) => {
-    const { data, error } = await supabase.from('contacts').select('*').order('name', { ascending: true });
+    const uid = getEffectiveUserId(req);
+    const { data, error } = await supabase
+        .from('contacts')
+        .select('*')
+        .eq('user_id', uid)
+        .order('name', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
 });
@@ -748,12 +830,35 @@ io.on('connection', (socket) => {
 
 // Server Initialization
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`WhatsApp service running on port ${PORT}`);
-});
+if (!process.env.JEST_WORKER_ID) {
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`WhatsApp service running on port ${PORT}`);
+    });
+}
 
 // Initial Load and Start
 loadSettings();
+
+// Preload WhatsApp sessions for all users that have auth files so they stay online even without an active WebSocket client
+(async function preloadWhatsAppSessions(){
+    try {
+        const authRoot = path.join(__dirname, 'auth_info_baileys');
+        if (!fs.existsSync(authRoot)) return;
+        const userDirs = fs.readdirSync(authRoot, { withFileTypes: true })
+                            .filter(dirent => dirent.isDirectory())
+                            .map(dirent => dirent.name);
+        for (const uid of userDirs) {
+            try {
+                await ensureSession(uid);
+                console.log('Preloaded WhatsApp session for user', uid);
+            } catch (err) {
+                console.error('Failed to preload session for', uid, err);
+            }
+        }
+    } catch (err) {
+        console.error('Error during WhatsApp session preload:', err);
+    }
+})();
 
 // ---------- Message Persistence Helper ----------
 async function recordMessage(params) {
@@ -783,4 +888,19 @@ async function recordMessage(params) {
         return null;
     }
 }
+
+// For test environment, stub ensureSession to always return a connected dummy session
+if (process.env.JEST_WORKER_ID) {
+    ensureSession = async () => ({
+        isConnected: true,
+        state: 'connected',
+        qr: null,
+        sock: {
+            sendMessage: async () => ({ key: { id: 'test-id' }, message: {} }),
+            user: { id: 'bot@s.whatsapp.net' }
+        }
+    });
+}
+
+module.exports = { app, server, ensureSession };
 
