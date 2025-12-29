@@ -30,14 +30,6 @@ router.get('/dashboard', isAuthenticated, async (req, res) => {
     }
 });
 
-// Chat interface
-router.get('/chat', isAuthenticated, (req, res) => {
-    res.render('chat', { 
-        page: 'chat', 
-        userId: req.user.id 
-    });
-});
-
 // Documentation
 router.get('/documentation', isAuthenticated, (req, res) => {
     res.render('documentation', { 

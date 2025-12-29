@@ -1,7 +1,6 @@
 <div align="center">
 
-# 📱 WhatsApp Webhook API Service
-  
+# WhatsApp Webhook API Service
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
 [![MongoDB](https://img.shields.io/badge/database-MongoDB-informational.svg)](https://www.mongodb.com/)
 [![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](https://opensource.org/licenses/ISC)
@@ -13,6 +12,17 @@
 
 ---
 </div>
+
+## Screenshoot
+
+### Tampilan Dashboard sebelum terhubung
+
+![alt text](image-1.png)
+
+### Tampilan Dashboard setelah terhubung
+
+![alt text](image.png)
+
 
 ## Fitur Utama
 
